@@ -5,7 +5,7 @@ Run this file with: streamlit run app.py
 
 import streamlit as st
 
-# ── Page configuration (must be first Streamlit call) ──────────────────────
+#    Page configuration (must be first Streamlit call) 
 st.set_page_config(
     page_title="CookMate 🍳",
     page_icon="🍳",
@@ -13,7 +13,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Initialise session state (stores data across pages) ────────────────────
+#    Initialise session state (stores data across pages) 
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {}
 if "nutrition_log" not in st.session_state:
@@ -26,15 +26,15 @@ if "onboarding_done" not in st.session_state:
     st.session_state.onboarding_done = False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ONBOARDING — shown only on first visit
-# ══════════════════════════════════════════════════════════════════════════════
+ 
+#  ONBOARDING - shown only on first visit
+#
 if not st.session_state.onboarding_done:
 
     st.title("🍳 Welcome to CookMate!")
     st.subheader("A smarter way to cook, eat, and enjoy food as a student.")
     st.markdown("---")
-    st.markdown("### Let's personalise your experience — it only takes a minute!")
+    st.markdown("### Let's personalise your experience - it only takes a minute!")
 
     with st.form("onboarding_form"):
 
@@ -95,21 +95,21 @@ if not st.session_state.onboarding_done:
                 st.rerun()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DASHBOARD — shown after onboarding
-# ══════════════════════════════════════════════════════════════════════════════
+
+#  DASHBOARD - shown after onboarding
+
 else:
     from recipes_data import RECIPES
 
     profile = st.session_state.user_profile
     name = profile.get("name", "Student")
 
-    # ── Header ──
+    #    Header   
     st.title(f"👋 Hey {name}, welcome to CookMate!")
     st.markdown("Use the **sidebar** to navigate between features.")
     st.markdown("---")
 
-    # ── Metrics row ──
+    #    Metrics row   
     col1, col2, col3, col4 = st.columns(4)
 
     meals_logged = len(st.session_state.nutrition_log)
@@ -128,7 +128,7 @@ else:
 
     st.markdown("---")
 
-    # ── Quick profile summary ──
+    #    Quick profile summary 
     col_a, col_b = st.columns(2)
 
     with col_a:
@@ -146,7 +146,7 @@ else:
 
     st.markdown("---")
 
-    # ── Recent cooking history ──
+    #    Recent cooking history 
     if st.session_state.cooking_history:
         st.markdown("#### 🕒 Recently cooked")
         recent_ids = st.session_state.cooking_history[-5:]
@@ -156,7 +156,7 @@ else:
     else:
         st.info("You haven't cooked anything yet! Head to the Recipe Finder to get started.")
 
-    # ── Reset button (bottom of page) ──
+    #    Reset button (bottom of page) 
     st.markdown("---")
     if st.button("⚙️ Reset profile & redo onboarding"):
         for key in ["user_profile", "nutrition_log", "meal_plan", "cooking_history", "onboarding_done"]:
