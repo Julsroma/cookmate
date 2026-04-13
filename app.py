@@ -41,7 +41,7 @@ if not st.session_state.onboarding_done:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("#### 👤 About you")
+            st.markdown("#### 👤 Your profile")
             name = st.text_input("Your name", placeholder="e.g. Maria")
 
             dietary = st.multiselect(
