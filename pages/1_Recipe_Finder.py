@@ -109,6 +109,13 @@ with st.sidebar:
         ["Vegetarian", "Vegan", "Gluten-free", "Dairy-free"]
     )
 
+    category_filter = st.multiselect(
+    "Meal type",
+    ["Breakfast", "Meal", "Snack", "Dessert"],
+    help="Filter by time of day or meal type"
+
+    )
+
     sort_by = st.selectbox(
         "Sort by",
         ["Best match (recommended)", "Cheapest first", "Fewest calories", "Fastest to cook", "Most protein"]
@@ -128,6 +135,9 @@ for r in RECIPES:
         continue
     # Difficulty filter
     if difficulty_filter and r["difficulty"] not in difficulty_filter:
+        continue
+    # Category filter
+    if category_filter and r.get("category") not in category_filter:
         continue
     # Dietary filter
     for d in dietary_filter:
