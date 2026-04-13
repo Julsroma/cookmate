@@ -18,13 +18,12 @@ if not st.session_state.get("onboarding_done"):
 profile = st.session_state.user_profile
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPER: Score a recipe for a given user (simple ML-style recommendation)
-# ══════════════════════════════════════════════════════════════════════════════
+
+#  Match a recipe to the user 
+ 
 def score_recipe(recipe, profile, cooking_history):
     """
     Returns a numeric score — the higher the score, the better the match.
-    This mimics a simple recommendation system.
     """
     score = 0
 
@@ -71,9 +70,9 @@ def score_recipe(recipe, profile, cooking_history):
     return score
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 #  PAGE LAYOUT
-# ══════════════════════════════════════════════════════════════════════════════
+
 st.title("🍳 Recipe Finder")
 st.markdown("Filter recipes by what you have, what fits your budget, and your preferences.")
 st.markdown("---")
@@ -86,41 +85,33 @@ with st.sidebar:
     ingredient_input = st.text_input(
         "Ingredients you have",
         placeholder="e.g. eggs, pasta, tomatoes",
-        help="Separate multiple ingredients with commas"
-    )
+        help="Separate multiple ingredients with commas")
 
     max_budget = st.slider(
         "Max cost per meal (CHF)",
         min_value=1.0, max_value=15.0,
         value=float(profile.get("budget", 80)) / 21 * 1.5,
-        step=0.5
-    )
+        step=0.5)
 
     max_time = st.slider("Max cooking time (min)", 5, 60, 60, step=5)
 
     difficulty_filter = st.multiselect(
         "Difficulty",
         ["Easy", "Medium", "Hard"],
-        default=["Easy", "Medium"]
-    )
+        default=["Easy", "Medium"])
 
     dietary_filter = st.multiselect(
         "Dietary requirements",
-        ["Vegetarian", "Vegan", "Gluten-free", "Dairy-free"]
-    )
+        ["Vegetarian", "Vegan", "Gluten-free", "Dairy-free"])
 
     category_filter = st.multiselect(
     "Meal type",
     ["Breakfast", "Meal", "Snack", "Dessert"],
-    help="Filter by time of day or meal type"
-
-    )
+    help="Filter by time of day or meal type")
 
     sort_by = st.selectbox(
         "Sort by",
-        ["Best match (recommended)", "Cheapest first", "Fewest calories", "Fastest to cook", "Most protein"]
-    )
-
+        ["Best match (recommended)", "Cheapest first", "Fewest calories", "Fastest to cook", "Most protein"])
 
 # ── Filter recipes ──
 user_ingredients = [i.strip().lower() for i in ingredient_input.split(",") if i.strip()]
@@ -177,7 +168,7 @@ st.markdown(f"### {len(filtered)} recipe(s) found")
 if not filtered:
     st.info("No recipes match your filters. Try relaxing some criteria!")
 else:
-    # Show 2 recipes per row
+    # This allows to show 2 recipes per row
     for i in range(0, len(filtered), 2):
         cols = st.columns(2)
         for j, col in enumerate(cols):
