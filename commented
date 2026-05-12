@@ -1,5 +1,5 @@
 """
-Recipes — search and browse recipes (API + DB).
+Recipes — search and browse recipes (API + DB).  \.
 Owner: <assign on Apr 22>
 Grading coverage:
     * Req. 2 (API — TheMealDB + Spoonacular)
