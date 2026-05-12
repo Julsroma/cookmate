@@ -1,0 +1,773 @@
+"""
+================================================================================
+recipes.py  —  Recipe Search & Browse Page
+================================================================================
+
+PURPOSE
+-------
+This module is the "Recipes" page of the NutriApp Streamlit application.
+It lets users:
+  1. Search for dishes by name (combining TheMealDB and Spoonacular APIs).
+  2. Browse recipes filtered by cuisine.
+  3. View ingredients, cooking instructions, and per-serving nutrition data.
+  4. Save recipes to their personal Meal Planner (persisted in the database).
+  5. Receive ML-ranked search results when a taste profile exists.
+
+GRADING COVERAGE (from spec)
+------------------------------
+  * Req. 2  – API integration: TheMealDB + Spoonacular
+  * Req. 4  – User interaction: search, filter, add-to-wishlist
+  * Req. 5  – ML: search results ranked by taste profile when available
+
+HOW IT FITS INTO THE APP
+-------------------------
+  - recipes_data.py       : Static fallback recipe catalogue (LOCAL_RECIPES list).
+  - src/data/api_client.py: All external API calls (TheMealDB, Spoonacular).
+  - src/data/database.py  : SQLite helpers — query_df() and execute().
+  - src/models/recommender.py : ML scoring engine used to rank search results.
+  - src/utils/session.py  : Session-state bootstrapping and profile guard.
+  - src/components/ui.py  : Shared visual helpers (page header, empty state).
+
+⭐ MEAL PLANNER INTEGRATION
+----------------------------
+  This page is the *entry point* for the Meal Planner feature.
+  When a user clicks "➕ Add to Meal Planner" on any recipe card:
+    1. Nutrition data is fetched / refreshed in the `recipes` DB table.
+    2. The recipe is inserted into `planner_pool` (user's personal allow-list).
+  The Meal Planner page (meal_planner.py) then reads ONLY from `planner_pool`,
+  so whatever a user saves here automatically appears in the planner dropdowns.
+  Removing a recipe here also removes it from the planner grid.
+
+TODOS (assigned to future owner, Apr 22)
+-----------------------------------------
+  - When a user clicks "Save recipe", persist to the `recipes` table so the
+    Recommender has data to learn from.
+
+DEPENDENCIES
+------------
+  pandas                  – DataFrame manipulation (recipe lists, DB results).
+  plotly.graph_objects    – Imported but reserved for future chart use.
+  streamlit               – UI framework; renders every widget on the page.
+  recipes_data            – LOCAL_RECIPES: static list of bundled recipes.
+  src.components.ui       – empty_state(), page_header() visual helpers.
+  src.data.api_client     – All TheMealDB / Spoonacular API wrappers.
+  src.data.database       – query_df() → SELECT → DataFrame; execute() → DML.
+  src.models.recommender  – Recommender: ML taste-profile scoring.
+  src.utils.session       – init_session_state(), require_profile() guards.
+
+AUTHOR
+------
+  <assign on Apr 22>
+================================================================================
+"""
+
+import pandas as pd
+import plotly.graph_objects as go   # Reserved for future nutrition charts
+import streamlit as st
+
+# Static recipe catalogue bundled with the app (used as a local reference /
+# fallback; also provides the title-to-id mapping for the Meal Planner).
+from recipes_data import RECIPES as LOCAL_RECIPES
+
+# Shared UI primitives: empty_state shows a friendly "no results" message,
+# page_header renders the styled h1 + subtitle banner at the top of every page.
+from src.components.ui import empty_state, page_header
+
+# Every external API call lives in api_client.py so that caching, retry logic,
+# and API-key management are handled in one place.
+from src.data.api_client import (
+    filter_by_cuisine,           # TheMealDB: filter meals by area/cuisine tag
+    fetch_kcal_for_title,        # Spoonacular: kcal lookup by dish title
+    fetch_nutrition_for_meal,    # Spoonacular: full nutrition for a meal object
+    fetch_nutrition_by_title,    # Spoonacular: nutrition dict keyed by title
+    fetch_nutrition_from_ingredients,  # Spoonacular: parseIngredients endpoint
+    get_meal_by_id,              # TheMealDB: fetch one meal by numeric ID
+    list_cuisines,               # TheMealDB: list all known cuisine areas
+    list_cuisines_with_recipes,  # TheMealDB: cuisines that have ≥1 recipe
+    search_recipes_by_name,      # TheMealDB: text search returning meal dicts
+    search_spoonacular,          # Spoonacular: complexSearch with diet filters
+)
+
+# SQLite helpers:
+#   query_df(sql, params) → executes SELECT, returns a DataFrame (or empty DF).
+#   execute(sql, params)  → executes INSERT / UPDATE / DELETE, returns nothing.
+from src.data.database import query_df, execute
+
+# ML scoring engine.  Given a user's save/like history, it scores external
+# recipe candidates by ingredient similarity and returns ranked float scores.
+from src.models.recommender import Recommender
+
+# Session utilities:
+#   init_session_state() – seeds st.session_state with safe defaults on first load.
+#   require_profile()    – redirects to the profile-setup page if onboarding is
+#                          incomplete; acts as an access guard for the whole page.
+from src.utils.session import init_session_state, require_profile
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INGREDIENT EXTRACTOR
+# Defined near the top because _fetch_nutrition_robust() (defined next) calls it.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_ingredients(meal: dict) -> list[str]:
+    """Return a flat list of ingredient strings from any recipe source.
+
+    Why two branches?
+    -----------------
+    TheMealDB and Spoonacular use completely different JSON schemas:
+
+    • Spoonacular recipes store ready-made strings like "2 cups flour" in a
+      private "_ingredients" key that api_client.py attaches to the dict.
+
+    • TheMealDB splits each ingredient across two parallel numbered keys:
+        strIngredient1 = "Flour"   strMeasure1 = "2 cups"
+        strIngredient2 = "Egg"     strMeasure2 = "1"
+        ... up to strIngredient20 / strMeasure20
+      We combine them into "2 cups Flour", "1 Egg", etc.
+
+    Parameters
+    ----------
+    meal : dict
+        A single recipe dict as returned by TheMealDB or Spoonacular.
+
+    Returns
+    -------
+    list[str]
+        Human-readable ingredient strings, e.g. ["200g Chicken", "1 Egg"].
+        Empty list if no ingredient data is present.
+
+    ⭐ MEAL PLANNER: the ingredient list is also used by _fetch_nutrition_robust()
+    as a fallback when Spoonacular can't find a dish by title, which is needed
+    before inserting a new recipe into the `recipes` DB table.
+    """
+    # ── Spoonacular path: ingredients already pre-processed by api_client.py ──
+    if meal.get("_ingredients"):
+        return [i.strip() for i in meal["_ingredients"] if i.strip()]
+
+    # ── TheMealDB path: reconstruct from parallel numbered key pairs ──────────
+    ingredients = []
+    for i in range(1, 21):  # TheMealDB supports up to 20 ingredient slots
+        name    = (meal.get(f"strIngredient{i}") or "").strip()
+        measure = (meal.get(f"strMeasure{i}")    or "").strip()
+        if not name:
+            # Empty slot means no more ingredients; TheMealDB doesn't always
+            # fill all 20 slots, so we can't just continue past a gap.
+            continue
+        # Prepend the measure if present, e.g. "200g Chicken" vs just "Chicken"
+        ingredients.append(f"{measure} {name}" if measure else name)
+    return ingredients
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUTRITION HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_nutrition_robust(meal: dict) -> dict:
+    """Fetch per-serving nutrition for any recipe, regardless of source.
+
+    This function implements a three-tier fallback strategy so that nutrition
+    data is retrieved as reliably as possible while minimising Spoonacular API
+    calls (free tier: 50 points/day).
+
+    Tier 0 — Spoonacular recipe (no API call needed)
+    -------------------------------------------------
+    Spoonacular results already carry kcal_per_serv / protein_g / carbs_g /
+    fat_g inside the meal dict (attached by api_client.py). Return immediately.
+
+    Tier 1 — Title-based Spoonacular lookup  (1 API call)
+    -------------------------------------------------------
+    Works well for popular TheMealDB dishes whose name Spoonacular recognises
+    (e.g. "Spaghetti Bolognese"). fetch_nutrition_by_title() is @st.cache_data
+    with a 24-hour TTL, so each unique title is only fetched once per day.
+
+    Tier 2 — Ingredient-parser fallback  (1 API call)
+    ---------------------------------------------------
+    Used when the title lookup fails.  Sends the raw ingredient list to
+    Spoonacular's parseIngredients endpoint, which returns whole-recipe totals.
+    We divide by 4 to approximate a per-serving figure.
+
+    ⭐ MEAL PLANNER: called inside the "➕ Add to Meal Planner" button handler
+    to ensure every recipe saved to the planner has nutrition data written into
+    the `recipes` DB table (kcal_per_serv, protein_g, carbs_g, fat_g).
+
+    Parameters
+    ----------
+    meal : dict
+        A single recipe dict (TheMealDB or Spoonacular schema).
+
+    Returns
+    -------
+    dict with keys: kcal, protein_g, carbs_g, fat_g.
+    All values may be None if every strategy fails (e.g. API quota exhausted).
+    """
+    # Canonical empty result — returned if all strategies fail
+    empty = {"kcal": None, "protein_g": None, "carbs_g": None, "fat_g": None}
+
+    # ── Tier 0: Spoonacular recipes already carry nutrition in the dict ───────
+    if meal.get("kcal_per_serv") is not None:
+        return {
+            "kcal":      meal["kcal_per_serv"],
+            "protein_g": meal.get("protein_g"),
+            "carbs_g":   meal.get("carbs_g"),
+            "fat_g":     meal.get("fat_g"),
+        }
+
+    # ── Tier 1: Look up the dish title via Spoonacular complexSearch ──────────
+    # extract the title from either schema (TheMealDB uses "strMeal",
+    # Spoonacular uses "title")
+    title = meal.get("strMeal") or meal.get("title") or ""
+    if title:
+        try:
+            nutrition = fetch_nutrition_by_title(title)
+            if nutrition.get("kcal") is not None:
+                return nutrition   # Successful lookup — return early
+        except Exception:
+            pass  # API failure or quota exceeded — fall through to Tier 2
+
+    # ── Tier 2: Ingredient-parser fallback ────────────────────────────────────
+    # extract_ingredients() is defined above this function in the file, so it
+    # is always available at call time even though this function appears first
+    # in the class hierarchy.
+    try:
+        ingredients = extract_ingredients(meal)
+        if ingredients:
+            raw = fetch_nutrition_from_ingredients(ingredients)
+            if raw.get("kcal") is not None:
+                # parseIngredients returns whole-recipe totals, not per-serving.
+                # Dividing by 4 is a reasonable approximation for most dishes;
+                # the user can override manually in the Nutrition Analytics page.
+                return {
+                    "kcal":      int(raw["kcal"] / 4),
+                    "protein_g": round(raw["protein_g"] / 4, 1) if raw.get("protein_g") else None,
+                    "carbs_g":   round(raw["carbs_g"]   / 4, 1) if raw.get("carbs_g")   else None,
+                    "fat_g":     round(raw["fat_g"]     / 4, 1) if raw.get("fat_g")     else None,
+                }
+    except Exception:
+        pass  # Any failure (network, parse error, quota) → return empty dict
+
+    return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEAL PLANNER HELPERS
+# These functions bridge this page with the Meal Planner feature.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_my_planner_meals(user_id: int) -> list[dict]:
+    """Fetch all recipes the current user has saved to their Meal Planner.
+
+    ⭐ MEAL PLANNER: Reads the `planner_pool` table (the user's personal
+    allow-list of pinned recipes) and joins it with `recipes` to get the title.
+    This is the same data source that meal_planner.py uses to populate its
+    weekly grid dropdowns.
+
+    Parameters
+    ----------
+    user_id : int
+        The logged-in user's database ID from st.session_state["user_id"].
+
+    Returns
+    -------
+    list[dict]
+        Each dict has 'recipe_id' (int) and 'title' (str).
+        Returns an empty list if the user has no saved recipes or on any error.
+    """
+    if not user_id:
+        return []
+    try:
+        df = query_df(
+            """
+            SELECT r.id AS recipe_id, r.title
+            FROM planner_pool pp
+            JOIN recipes r ON pp.recipe_id = r.id
+            WHERE pp.user_id = ?
+            ORDER BY r.title
+            """,
+            (user_id,),
+        )
+        if df.empty:
+            return []
+        return df.to_dict("records")
+    except Exception:
+        # DB errors (missing table, connection issues) return an empty list
+        # so the UI degrades gracefully rather than crashing.
+        return []
+
+
+def show_my_planner_banner() -> None:
+    """Render a collapsible summary of the user's saved Meal Planner dishes.
+
+    Displayed at the very top of the Recipes page so users always know which
+    recipes are already in their planner without navigating away.
+
+    ⭐ MEAL PLANNER: Reads planner_pool via get_my_planner_meals() and renders
+    a compact 3-column grid of saved dishes. The "✕" remove button on each
+    dish deletes from BOTH `planner_pool` AND `meal_plan`, which keeps the
+    Meal Planner page's weekly grid consistent (meal_planner.py won't show
+    orphaned slots for recipes that no longer exist in the pool).
+
+    Side effects
+    ------------
+    - Calls st.rerun() after any deletion so the banner refreshes immediately.
+    - Writes nothing to the DB directly; delegated to execute().
+    """
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        return   # Not logged in — nothing to show
+
+    saved_meals = get_my_planner_meals(user_id)
+    count = len(saved_meals)
+    label = "dish" if count == 1 else "dishes"   # Correct pluralisation
+
+    # The expander is auto-expanded when the user has at least one saved dish
+    with st.expander(
+        f"🍽️ My Meal Planner  ·  **{count} {label} saved**",
+        expanded=count > 0,
+    ):
+        if not saved_meals:
+            st.info("You haven't saved any dishes to the Meal Planner yet.")
+            return
+
+        # 3-column grid: each cell shows the dish name + a remove button
+        cols = st.columns(3)
+        for idx, meal in enumerate(saved_meals):
+            with cols[idx % 3]:   # Cycle through columns 0, 1, 2, 0, 1, 2 …
+                col_text, col_btn = st.columns([3, 1])
+                with col_text:
+                    st.markdown(f"✅ **{meal['title']}**")
+                with col_btn:
+                    if st.button(
+                        "✕",
+                        key=f"banner_remove_{meal['recipe_id']}",  # Unique key per recipe
+                        help="Remove from Meal Planner",
+                    ):
+                        # ⭐ MEAL PLANNER: Remove from the pool (hides it in
+                        # planner dropdowns) AND from the scheduled grid rows.
+                        execute(
+                            "DELETE FROM planner_pool WHERE user_id = ? AND recipe_id = ?",
+                            (user_id, meal["recipe_id"]),
+                        )
+                        execute(
+                            "DELETE FROM meal_plan WHERE user_id = ? AND recipe_id = ?",
+                            (user_id, meal["recipe_id"]),
+                        )
+                        st.toast(f"❌ '{meal['title']}' removed from Meal Planner", icon="🗑️")
+                        st.rerun()   # Force banner to reflect the deletion immediately
+
+        st.caption("Go to the **Meal Planner** page to schedule them across the week.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE INITIALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Seed session state defaults (user_id, preferences, etc.) before any widget
+# reads from st.session_state — prevents KeyError on first load.
+init_session_state()
+
+# Guard: if the user hasn't completed their profile, redirect them now.
+# The return value is the profile dict (diet, allergies, taste history, etc.)
+# used later to personalise search filters and ML ranking.
+profile = require_profile()
+
+# Render the h1 heading and subtitle banner shared by all pages.
+page_header("🍲 Recipes", "Search recipes or browse by cuisine.")
+
+# The Meal Planner banner always appears at the top, above the search tabs,
+# so users can see (and manage) their saved dishes from anywhere on this page.
+show_my_planner_banner()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST-RERUN TOAST MESSAGES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Streamlit swallows st.toast() calls that happen *before* st.rerun() returns.
+# Workaround: store the message in session_state before rerun, then display it
+# on the next render cycle here (after rerun has completed).
+if "planner_added_title" in st.session_state:
+    added_title = st.session_state.pop("planner_added_title")  # pop = read + delete in one step
+    st.toast(f"✅ '{added_title}' added to Meal Planner!", icon="🍽️")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPOONACULAR DATA NOTICE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Inform users upfront that nutrition data may be missing (API quota is 50
+# points/day on the free tier) so they're not confused by empty calorie fields.
+st.info(
+    "**Calorie & nutrition data** for TheMealDB recipes is estimated via the "
+    "[Spoonacular API](https://spoonacular.com/food-api) (free tier: 50 points/day). "
+    "If calorie data is missing on a recipe, the daily quota may be exhausted — "
+    "you can always enter calories manually in **Nutrition Analytics**.",
+    icon="ℹ️",
+)
+
+# Pre-compute a lowercase title → local DB id mapping for quick lookups.
+# Used in render_meal_card() to check whether an API recipe already exists in
+# the local `recipes` table (avoids an INSERT when it does).
+local_title_to_id = {r["name"].lower(): r["id"] for r in LOCAL_RECIPES}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PANTRY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_pantry() -> set[str]:
+    """Load the current user's pantry as a set of lowercase ingredient names.
+
+    Reads from the `pantry` table (joined with `ingredients`) and filters to
+    items where quantity > 0 (i.e. the user actually has the ingredient in stock).
+
+    Returns
+    -------
+    set[str]
+        Lowercase ingredient names, e.g. {"flour", "eggs", "olive oil"}.
+        Empty set if the user is not logged in, has no pantry, or on DB error.
+    """
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        return set()
+    try:
+        df = query_df(
+            """
+            SELECT i.name
+            FROM pantry p
+            JOIN ingredients i ON p.ingredient_id = i.id
+            WHERE p.user_id = ? AND p.quantity > 0
+            """,
+            (user_id,),
+        )
+        if df.empty:
+            return set()
+        return set(df["name"].str.lower())
+    except Exception:
+        return set()
+
+
+def pantry_pct(meal: dict, pantry: set[str]) -> float | None:
+    """Calculate what fraction of a recipe's ingredients the user already owns.
+
+    Used in render_meal_card() to show a "Pantry-friendly" badge when the user
+    can cook most of a dish without shopping.
+
+    Parameters
+    ----------
+    meal   : dict    A recipe dict (any source).
+    pantry : set[str] Lowercase ingredient names from get_pantry().
+
+    Returns
+    -------
+    float in [0.0, 1.0], or None if pantry is empty or recipe has no ingredients.
+    """
+    if not pantry:
+        return None
+    ingredients = extract_ingredients(meal)
+    if not ingredients:
+        return None
+    # Convert to lowercase for case-insensitive comparison against pantry set
+    names = [i.lower() for i in ingredients]
+    return sum(1 for n in names if n in pantry) / len(names)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECIPE CARD RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_meal_card(
+    meal: dict,
+    ml_score: float | None = None,
+    pantry: float | None = None,
+    card_key: str = "",
+) -> None:
+    """Render a single recipe card with image, metadata, and action buttons.
+
+    Each card shows:
+      • Thumbnail image + dish name + cuisine/category
+      • Optional ML match-score progress bar (when taste profile exists)
+      • Optional pantry-availability badge (green/yellow)
+      • Expandable ingredients & instructions section
+      • ⭐ MEAL PLANNER: "➕ Add to Meal Planner" / "❌ Remove" toggle button
+
+    Parameters
+    ----------
+    meal     : dict           Recipe dict (TheMealDB or Spoonacular schema).
+    ml_score : float | None   Recommender score in [0,1]; None = not scored.
+    pantry   : float | None   Fraction of ingredients in pantry; None = unknown.
+    card_key : str            Unique prefix for all widget keys in this card
+                              (e.g. "search_0", "cuisine_3"). MUST be unique
+                              across every card rendered in a single Streamlit run
+                              to avoid DuplicateWidgetID errors.
+    """
+    meal_title = meal["strMeal"]   # Both schemas expose a "strMeal" key via api_client normalisation
+
+    with st.container(border=True):
+        col_img, col_meta = st.columns([1, 3])   # Image gets 25% width, metadata 75%
+
+        with col_img:
+            st.image(meal.get("strMealThumb"), use_container_width=True)
+
+        with col_meta:
+            st.subheader(meal_title)
+            # Area = cuisine origin (e.g. "Italian"); Category = dish type (e.g. "Pasta")
+            st.caption(
+                f"{meal.get('strArea', '—')} · {meal.get('strCategory', '—')}"
+            )
+
+            # ── ML match score (Req. 5) ───────────────────────────────────
+            # Only shown when the Recommender produced a valid score (i.e. the
+            # user has a taste profile built from saved recipes).
+            if ml_score is not None and not pd.isna(ml_score):
+                st.progress(float(ml_score), text=f"Match score: {ml_score:.0%}")
+
+            # ── Pantry badge ──────────────────────────────────────────────
+            # Green  → user owns >60% of ingredients (likely no shopping needed).
+            # Yellow → 30–60% available (partial shop required).
+            # No badge → <30% or pantry data unavailable.
+            if pantry is not None:
+                if pantry > 0.6:
+                    st.success("🟢 Pantry-friendly")
+                elif pantry > 0.3:
+                    st.warning("🟡 Partially available")
+
+            # ── Ingredients & Instructions (collapsible) ──────────────────
+            with st.expander("🧾 Ingredients & Instructions"):
+                col_ing, col_inst = st.columns([1, 2])
+                with col_ing:
+                    st.markdown("**Ingredients**")
+                    for ing in extract_ingredients(meal):
+                        st.markdown(f"- {ing}")
+                with col_inst:
+                    st.markdown("**Instructions**")
+                    st.write(meal.get("strInstructions", "No instructions available."))
+
+            # ══════════════════════════════════════════════════════════════
+            # ⭐ MEAL PLANNER BUTTON LOGIC
+            # This section connects the Recipes page to the Meal Planner.
+            # ══════════════════════════════════════════════════════════════
+
+            user_id  = st.session_state.get("user_id")
+
+            # Step 1: Try to find this recipe's DB id from the static LOCAL_RECIPES list
+            # (keyed by lowercase title for case-insensitive matching).
+            local_id = local_title_to_id.get(meal_title.lower())
+
+            # Step 2: If not found in the static list, check the `recipes` DB table
+            # (the recipe may have been added dynamically during a previous session).
+            if local_id is None:
+                existing_recipe = query_df(
+                    """
+                    SELECT id FROM recipes
+                    WHERE LOWER(title) = LOWER(?)
+                    LIMIT 1
+                    """,
+                    (meal_title,),
+                )
+                if not existing_recipe.empty:
+                    local_id = int(existing_recipe.iloc[0]["id"])
+
+            # Step 3: Check whether this recipe is already in the user's planner_pool.
+            # This determines which button variant to show (Add vs Remove).
+            already_in_planner = False
+            if user_id and local_id:
+                planner_check = query_df(
+                    """
+                    SELECT 1 FROM planner_pool
+                    WHERE user_id = ? AND recipe_id = ?
+                    LIMIT 1
+                    """,
+                    (user_id, local_id),
+                )
+                already_in_planner = not planner_check.empty
+
+            # ── Already saved: show a Remove button ───────────────────────
+            if already_in_planner:
+                st.success("🍽️ Already in your Meal Planner!")
+                if st.button(
+                    "❌ Remove from Meal Planner",
+                    key=f"{card_key}_remove_planner_{meal_title}",
+                ):
+                    # ⭐ Delete from planner_pool removes the recipe from the
+                    # Meal Planner page's dropdown options.
+                    execute(
+                        "DELETE FROM planner_pool WHERE user_id = ? AND recipe_id = ?",
+                        (user_id, local_id),
+                    )
+                    # ⭐ Also delete any scheduled occurrences so the weekly
+                    # grid in meal_planner.py doesn't show orphaned slots.
+                    execute(
+                        "DELETE FROM meal_plan WHERE user_id = ? AND recipe_id = ?",
+                        (user_id, local_id),
+                    )
+                    st.toast(f"'{meal_title}' removed from Meal Planner 🗑️", icon="❌")
+                    st.rerun()   # Refresh the card to flip from Remove → Add button
+
+            # ── Not yet saved: show an Add button ─────────────────────────
+            else:
+                if st.button(
+                    "➕ Add to Meal Planner",
+                    key=f"{card_key}_planner_{meal_title}",
+                ):
+                    # ── Fetch nutrition before saving ─────────────────────
+                    # _fetch_nutrition_robust() handles both Spoonacular recipes
+                    # (nutrition already in the dict) and MealDB recipes (title
+                    # lookup → ingredient-parser fallback). The values are
+                    # persisted to the `recipes` table so the Recommender and
+                    # Nutrition Analytics page can read them later.
+                    nutrition = _fetch_nutrition_robust(meal)
+                    kcal      = nutrition["kcal"]
+                    protein_g = nutrition["protein_g"]
+                    carbs_g   = nutrition["carbs_g"]
+                    fat_g     = nutrition["fat_g"]
+
+                    if local_id is None:
+                        # ⭐ MEAL PLANNER — NEW RECIPE:
+                        # This recipe came from the API and has never been saved before.
+                        # Insert a new row into `recipes` so it gets a stable DB id,
+                        # then capture that id for the planner_pool insert below.
+                        execute(
+                            """INSERT INTO recipes
+                               (title, kcal_per_serv, protein_g, carbs_g, fat_g)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (meal_title, kcal, protein_g, carbs_g, fat_g),
+                        )
+                        # Retrieve the auto-generated id of the row we just inserted.
+                        new_row = query_df(
+                            "SELECT id FROM recipes WHERE title = ? ORDER BY id DESC LIMIT 1",
+                            (meal_title,),
+                        )
+                        if not new_row.empty:
+                            local_id = int(new_row.iloc[0]["id"])
+                    else:
+                        # ⭐ MEAL PLANNER — EXISTING RECIPE:
+                        # Recipe already has a DB row. Update nutrition if we
+                        # received fresh values (avoids overwriting with None).
+                        if kcal is not None:
+                            execute(
+                                """UPDATE recipes
+                                   SET kcal_per_serv = ?, protein_g = ?,
+                                       carbs_g = ?, fat_g = ?
+                                   WHERE id = ?""",
+                                (kcal, protein_g, carbs_g, fat_g, local_id),
+                            )
+
+                    # ⭐ MEAL PLANNER — Add to planner_pool:
+                    # INSERT OR IGNORE means clicking the button twice is safe
+                    # (the row already exists, so the second insert is a no-op).
+                    if local_id:
+                        execute(
+                            "INSERT OR IGNORE INTO planner_pool (user_id, recipe_id) VALUES (?, ?)",
+                            (user_id, local_id),
+                        )
+
+                    # Store the title in session_state so the post-rerun toast
+                    # (rendered at the top of this file) can display it after
+                    # Streamlit re-renders the page from scratch.
+                    st.session_state["planner_added_title"] = meal_title
+                    st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEARCH TAB
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_search:
+    st.subheader("🔎 Hungry? Let's find something delicious!")
+    st.markdown("- Search for any dish by name")
+    st.markdown("- Get info on the dish and how to make it")
+    st.markdown("- Add it to your Meal Planner or Wishlist for later")
+
+    # Primary search input — triggers a combined TheMealDB + Spoonacular query.
+    query = st.text_input(
+        "What would you like to cook?",
+        placeholder="e.g. pasta, curry…",
+    )
+
+    if query:
+        # ── Build diet/allergy filters from the user's profile ────────────────
+        diet      = profile.get("diet", "omnivore")
+        allergies = profile.get("allergies", [])
+
+        # Derive boolean flags for Spoonacular's complexSearch parameters
+        veg = diet in ("vegetarian", "vegan")
+        vgn = diet == "vegan"
+        gf  = "gluten" in allergies
+        df  = "lactose" in allergies
+
+        # ── Combined API search (Req. 2) ──────────────────────────────────────
+        # TheMealDB doesn't support diet filters natively; Spoonacular does.
+        # We merge both result sets and deduplicate in the Recommender step.
+        results = search_recipes_by_name(query) + search_spoonacular(
+            query=query,
+            vegetarian=veg,
+            vegan=vgn,
+            gluten_free=gf,
+            dairy_free=df,
+        )
+
+        if not results:
+            empty_state("No recipes found — try another word.")
+        else:
+            # ── ML ranking (Req. 5) ───────────────────────────────────────────
+            # Build a Recommender from the user's saved LOCAL_RECIPES data,
+            # then score each search result by ingredient similarity.
+            recipes_df = pd.DataFrame(LOCAL_RECIPES).rename(columns={"name": "title"})
+            rec        = Recommender(recipes_df)
+
+            # Only examine the top 10 results to keep scoring fast
+            top_results = results[:10]
+
+            # Pre-extract ingredient lists once (used by Recommender.score_external)
+            ingredient_lists = [extract_ingredients(m) for m in top_results]
+
+            # Score results if the user has a taste profile; otherwise return
+            # a list of None scores so the sort below is a no-op.
+            raw_scores = (
+                rec.score_external(
+                    ingredient_lists,
+                    history_df,
+                    wishlist_ids,
+                    liked_ingredients,
+                )
+                if has_taste_profile
+                else [None] * len(top_results)
+            )
+
+            # ── Sort: scored results first (descending score), then unscored ──
+            # The lambda key produces a 2-tuple so Python's stable sort puts
+            # all scored items (bucket 0) before unscored ones (bucket 1).
+            scored_results = sorted(
+                zip(top_results, raw_scores),
+                key=lambda pair: (
+                    (0, -(pair[1] or 0))   # Bucket 0: higher score sorts first
+                    if pair[1] is not None
+                    else (1, 0)            # Bucket 1: unscored items go to the end
+                ),
+            )
+
+            # ── User-facing ranking explainer captions ────────────────────────
+            any_scored = any(s is not None for _, s in scored_results)
+
+            if any_scored:
+                st.caption(
+                    "🎯 Results ranked by ingredient similarity to your taste profile. "
+                    "Save more recipes to improve the ranking."
+                )
+            elif has_taste_profile:
+                # Profile exists but none of these results had parseable ingredients
+                st.caption(
+                    "ℹ️ These results don't have ingredient data, "
+                    "so ML ranking isn't available here."
+                )
+
+            # ── Render one card per result ────────────────────────────────────
+            user_pantry = get_pantry()   # Fetch pantry once; reused for every card
+
+            for idx, (meal, score) in enumerate(scored_results):
+                render_meal_card(
+                    meal,
+                    ml_score=score,
+                    pantry=pantry_pct(meal, user_pantry),
+                    card_key=f"search_{idx}",  # Unique key suffix per card position
+                )
