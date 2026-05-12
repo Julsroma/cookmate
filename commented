@@ -1,0 +1,397 @@
+"""
+=============================================================================
+MEAL PLANNER PAGE  —  4_Meal_Planner.py
+=============================================================================
+PURPOSE
+-------
+This is a Streamlit page that renders a weekly meal-planning grid.
+Users can assign recipes to specific meal slots (Breakfast, Lunch, Dinner,
+Snacks) for each day of the week, navigate between weeks, and remove meals.
+
+HOW IT FITS INTO THE LARGER APP
+--------------------------------
+This file is one page inside a multi-page Streamlit app.  The folder
+structure follows Streamlit's convention where files in a `pages/` folder
+are automatically turned into sidebar nav entries.
+
+The `sys.path.append(...)` at the top is a common workaround so that shared
+modules living in a sibling `src/` folder can be imported without installing
+the project as a package.
+
+DEPENDENCIES (external libraries)
+-----------------------------------
+  - streamlit          : UI framework; renders every widget, column, and button.
+  - pandas             : Handles query results as DataFrames and does lightweight
+                         data manipulation (iterrows, set_index).
+  - datetime (stdlib)  : date, timedelta — all week-boundary arithmetic.
+  - sys, os (stdlib)   : Only used for the path hack at the top.
+
+DEPENDENCIES (internal project modules)
+-----------------------------------------
+  - src.data.database
+      query_df(sql, params)  -> executes a SELECT and returns a DataFrame
+                                (or None if no rows / table missing).
+      execute(sql, params)   -> executes INSERT / DELETE / UPDATE statements.
+
+  - src.utils.session
+      init_session_state()   -> seeds st.session_state with default keys so
+                                the rest of the app never hits KeyError.
+      require_profile()      -> redirects to a profile-setup page if the user
+                                hasn't created a profile yet.  Acts as a guard.
+
+  - src.components.ui
+      page_header(title, subtitle) -> renders a styled h1 + subtitle banner.
+
+DATABASE TABLES USED
+---------------------
+  meal_plan    : one row per (user, date, meal_type, recipe).
+                 Primary key `id` is used for targeted deletes.
+  recipes      : master recipe catalogue; joined for human-readable titles.
+  planner_pool : a per-user allow-list of recipes that the user has
+                 "pinned" to their planner.  Only these appear in dropdowns.
+
+NOTE ON AI ASSISTANCE
+----------------------
+The overall structure (selectbox sentinel pattern, week-boundary arithmetic,
+plan dict keyed on (date_iso, meal_type)) shows patterns typical of
+AI-assisted Streamlit boilerplate.  The inline comment block explaining the
+planner_pool design decision (see LOAD RECIPES section) reads like it was
+written deliberately to document an intentional architectural choice,
+consistent with AI-generated explanatory comments.
+=============================================================================
+"""
+
+import streamlit as st
+from datetime import date, timedelta
+import sys
+import os
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# PATH HACK
+# ---------------------------------------------------------------------------
+# Streamlit pages live inside a `pages/` sub-folder, which means Python's
+# module resolver cannot find sibling folders like `src/` without this line.
+# `os.path.dirname(__file__)` is the `pages/` directory; `..` steps up one
+# level to the project root so `src.*` imports resolve correctly.
+# This is a standard workaround for multi-page Streamlit apps that do not use
+# a proper package install (i.e. no `pip install -e .` or setup.py).
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+# Internal project modules (see DEPENDENCIES section in the module docstring)
+from src.data.database import query_df, execute
+from src.utils.session import init_session_state, require_profile
+from src.components.ui import page_header
+
+# ---------------------------------------------------------------------------
+# PAGE CONFIG  (must be the very first Streamlit call in any page file)
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Meal Planner", page_icon="📅", layout="wide")
+
+# Seed default session_state keys defined centrally in src.utils.session.
+# Called here — before any widget — so every key exists before it is read.
+init_session_state()
+
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+# Day and meal names are defined once here so they drive both the grid header
+# row and the per-row iteration below.  Changing the order here changes the UI.
+DAYS  = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks"]
+
+
+# ---------------------------------------------------------------------------
+# FUNCTION: load_meals_for_week
+# ---------------------------------------------------------------------------
+def load_meals_for_week(user_id: int, week_start: date, week_end: date):
+    """
+    Fetch all planned meals for a given user within a date range (inclusive).
+
+    Joins meal_plan with recipes so callers get the recipe title directly
+    without a second query.
+
+    Parameters
+    ----------
+    user_id    : int   — the logged-in user's database ID.
+    week_start : date  — Monday of the displayed week.
+    week_end   : date  — Sunday of the displayed week (week_start + 6 days).
+
+    Returns
+    -------
+    pd.DataFrame with columns: id, meal_date, meal_type, recipe_id, title.
+    Returns an empty DataFrame (same columns) if the query yields no rows,
+    preventing KeyError / AttributeError downstream.
+    """
+    query = """
+        SELECT mp.id, mp.meal_date, mp.meal_type, mp.recipe_id, r.title
+        FROM meal_plan mp
+        JOIN recipes r ON mp.recipe_id = r.id
+        WHERE mp.user_id = ?
+        AND mp.meal_date BETWEEN ? AND ?
+        ORDER BY mp.meal_date, mp.meal_type
+    """
+    meals_df = query_df(
+        query,
+        # Dates are stored as ISO strings ("YYYY-MM-DD") in SQLite,
+        # which supports lexicographic BETWEEN comparisons on that format.
+        (user_id, week_start.isoformat(), week_end.isoformat())
+    )
+
+    # query_df returns None when there are no rows; normalise to empty DF
+    # so the rest of the code can always call .iterrows() safely.
+    if meals_df is None:
+        meals_df = pd.DataFrame(
+            columns=["id", "meal_date", "meal_type", "recipe_id", "title"]
+        )
+    return meals_df
+
+
+# ---------------------------------------------------------------------------
+# WEEK-STATE INITIALISATION
+# ---------------------------------------------------------------------------
+# On first load, default the displayed week to the current Monday.
+# timedelta(days=today.weekday()) subtracts the ISO weekday index (0=Mon, 6=Sun),
+# so the result is always the Monday of whatever week "today" falls in.
+if "week_start" not in st.session_state:
+    today = date.today()
+    st.session_state.week_start = today - timedelta(days=today.weekday())
+
+# week_current = the Monday of today's real-world week.
+# Used later to disable the "Next week" button so users cannot plan
+# further ahead than the current week.
+week_current = date.today() - timedelta(days=date.today().weekday())
+
+week_start = st.session_state.week_start
+week_end   = week_start + timedelta(days=6)   # always a Sunday
+
+# A stable string identifier for the displayed week, used as a cache key.
+week_id = week_start.isoformat()   # e.g. "2025-05-05"
+
+# ---------------------------------------------------------------------------
+# STALE WIDGET CLEANUP
+# ---------------------------------------------------------------------------
+# When the user navigates to a different week, any selectbox widgets that were
+# rendered for the previous week still hold stale keys in session_state.
+# Streamlit will throw DuplicateWidgetID errors if a key exists in
+# session_state but the widget that owned it is no longer on screen.
+# Solution: detect a week change via `active_week`, then delete all keys that
+# start with "meal_" — the prefix used for selectbox keys further below.
+if st.session_state.get("active_week") != week_id:
+    keys_to_delete = [
+        k for k in list(st.session_state.keys())
+        if isinstance(k, str) and k.startswith("meal_")
+    ]
+    for k in keys_to_delete:
+        del st.session_state[k]
+    # Record the new active week so this block only fires once per navigation.
+    st.session_state.active_week = week_id
+
+# ---------------------------------------------------------------------------
+# AUTH / PROFILE GUARD
+# ---------------------------------------------------------------------------
+# Redirects to profile setup if the user has not completed onboarding yet.
+# Must be called before any data-fetching to avoid querying with a null user_id.
+require_profile()
+
+# Renders the styled page title banner at the top of the page.
+page_header("📅 Meal Planner", "Choose your meals in the recipe page and plan your week")
+
+# ---------------------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------------------
+
+# Fetch all planned meals for the currently displayed week.
+meals_df = load_meals_for_week(
+    user_id=st.session_state.user_id,
+    week_start=week_start,
+    week_end=week_end
+)
+
+# ---------------------------------------------------------------------------
+# RECIPE DROPDOWN SOURCE  —  planner_pool, NOT the full recipes table
+# ---------------------------------------------------------------------------
+# IMPORTANT DESIGN DECISION (comment block is likely AI-assisted):
+#   Recipes are loaded from `planner_pool` (the user's personal allow-list),
+#   not from the full `recipes` table.
+#   This means each dropdown only shows recipes the user has explicitly
+#   "saved to planner" from the Recipes page.
+#   Side-effect: removing a recipe from the Recipes page also removes it
+#   from this dropdown instantly — both are driven by the same planner_pool table.
+recipes_df = query_df(
+    """
+    SELECT pp.recipe_id AS id, r.title
+    FROM planner_pool pp
+    JOIN recipes r ON pp.recipe_id = r.id
+    WHERE pp.user_id = ?
+    ORDER BY r.title
+    """,
+    (st.session_state.user_id,)
+)
+
+# Normalise None to an empty DataFrame (same pattern as load_meals_for_week).
+if recipes_df is None:
+    recipes_df = pd.DataFrame(columns=["id", "title"])
+
+# Build a plain dict {recipe_id: title} for fast O(1) lookups in the grid.
+recipe_dict = recipes_df.set_index("id")["title"].to_dict()
+
+# ---------------------------------------------------------------------------
+# PLAN DICT  —  fast lookup structure for the grid
+# ---------------------------------------------------------------------------
+# Convert the meals DataFrame into a dict keyed on (date_iso, meal_type).
+# Example key: ("2025-05-05", "Breakfast")
+# This lets each grid cell check in O(1) whether a meal has been planned,
+# rather than filtering the DataFrame 28 times (7 days x 4 meal types).
+plan = {}
+for _, row in meals_df.iterrows():
+    # pd.to_datetime handles any string or datetime representation from SQLite.
+    d = pd.to_datetime(row["meal_date"]).date().isoformat()
+    plan[(d, row["meal_type"])] = row
+
+# ---------------------------------------------------------------------------
+# WEEK NAVIGATION
+# ---------------------------------------------------------------------------
+# Three-column layout: [<- Prev] [date range label] [Next ->]
+c1, c2, c3 = st.columns([1, 2, 1])
+
+with c1:
+    if st.button("← Prev week"):
+        # Move the session's week_start back by 7 days and redraw the page.
+        st.session_state.week_start = week_start - timedelta(days=7)
+        st.rerun()
+
+with c2:
+    # Display the human-readable range, e.g. "May 05 – May 11, 2025"
+    st.markdown(f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}")
+
+with c3:
+    # Disable "Next week" when the displayed week IS the current week.
+    # Prevents users from pre-planning future weeks beyond the current one.
+    disable_next = week_start >= week_current
+    if st.button("Next week →", disabled=disable_next):
+        if not disable_next:
+            st.session_state.week_start = week_start + timedelta(days=7)
+            st.rerun()
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# MEAL GRID
+# ---------------------------------------------------------------------------
+st.subheader("Your Week")
+
+# Header row: empty label column + one column per day (8 columns total).
+cols = st.columns(8)   # col 0 = meal-type label; cols 1-7 = Mon-Sun
+cols[0].write("")      # blank top-left cell
+
+for i in range(7):
+    d = week_start + timedelta(days=i)
+    # Bold day name on the first line, short date on the second line.
+    # e.g. "**Monday**\n05 May"
+    cols[i + 1].markdown(f"**{DAYS[i]}**  \n{d.strftime('%d %b')}")
+
+st.divider()
+
+# Emoji icons per meal type — purely cosmetic, helps rows scan faster.
+icons = {
+    "Breakfast": "🍳",
+    "Lunch":     "🥗",
+    "Dinner":    "🍝",
+    "Snacks":    "🍰"
+}
+
+# One row per meal type (Breakfast, Lunch, Dinner, Snacks)
+for meal in MEALS:
+    row = st.columns(8)
+    row[0].markdown(f"**{meal}**")   # Row label in the left-most column
+
+    # One cell per day of the week
+    for i in range(7):
+        d   = week_start + timedelta(days=i)
+        key = (d.isoformat(), meal)   # lookup key into the plan dict
+
+        with row[i + 1]:
+
+            # ---------------------------------------------------------------
+            # CASE A: a meal has already been planned for this slot
+            # ---------------------------------------------------------------
+            if key in plan:
+                meal_data = plan[key]
+
+                # Show the meal title with its emoji icon.
+                st.markdown(f"{icons.get(meal, '🍽')} **{meal_data['title']}**")
+
+                # Delete button — labelled "x" to keep the cell compact.
+                # Key is prefixed with "del_" + the meal_plan row ID so it is
+                # globally unique across the entire grid.
+                if st.button("✕", key=f"del_{meal_data['id']}"):
+                    execute(
+                        # Delete by both id AND user_id as a safety check —
+                        # a user can never accidentally delete another user's
+                        # meal even if database IDs were somehow guessed.
+                        "DELETE FROM meal_plan WHERE id = ? AND user_id = ?",
+                        (meal_data["id"], st.session_state.user_id)
+                    )
+                    st.rerun()   # Re-render so the deleted cell shows as empty
+
+            # ---------------------------------------------------------------
+            # CASE B: slot is empty — show a recipe picker dropdown
+            # ---------------------------------------------------------------
+            else:
+                if not recipe_dict:
+                    # Edge case: the user has not added any recipes to their
+                    # planner pool yet.  Show a helpful hint instead of an
+                    # empty/broken dropdown.
+                    st.caption("No recipes saved yet. Go to Recipes to add some!")
+                else:
+                    # Build a unique key for this selectbox widget.
+                    # Format: meal_{week}_{meal_type}_{date}_{col_index}
+                    # Including `i` (column index) is a defensive measure
+                    # to guarantee uniqueness even in unusual edge cases.
+                    select_key = f"meal_{week_id}_{meal}_{d.isoformat()}_{i}"
+
+                    # -----------------------------------------------------------
+                    # SENTINEL PATTERN  (AI-assisted workaround for Streamlit quirk)
+                    # -----------------------------------------------------------
+                    # Streamlit renders an unwanted (x) clear button on the
+                    # selectbox when the selected value is None.
+                    # Fix: use an empty string "" as the "nothing selected"
+                    # sentinel instead of None, then map it to "Select..." text
+                    # via format_func.  This is a known Streamlit workaround.
+                    PLACEHOLDER = ""
+                    options = [PLACEHOLDER] + list(recipe_dict.keys())
+
+                    selected_raw = st.selectbox(
+                        " ",   # A single space acts as a visually hidden label
+                        options=options,
+                        format_func=lambda x: "Select..." if x == PLACEHOLDER else recipe_dict.get(x, x),
+                        key=select_key,
+                        label_visibility="collapsed"
+                    )
+
+                    # Convert the sentinel back to None for the check below.
+                    selected = selected_raw if selected_raw != PLACEHOLDER else None
+
+                    # Only write to the database when the user picked a real recipe.
+                    if selected:
+                        execute(
+                            """
+                            INSERT OR REPLACE INTO meal_plan
+                            (user_id, meal_date, meal_type, recipe_id)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            # INSERT OR REPLACE handles the case where a meal
+                            # for this (user, date, meal_type) combination already
+                            # exists — it replaces it atomically rather than
+                            # throwing a UNIQUE constraint violation error.
+                            (
+                                st.session_state.user_id,
+                                d.isoformat(),
+                                meal,
+                                selected
+                            )
+                        )
+                        st.rerun()   # Re-render so the new meal shows via CASE A
+
+st.divider()
