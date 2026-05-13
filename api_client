@@ -1,0 +1,802 @@
+# ============================================================================
+#  api_client.py  —  Data-fetching layer for the recipe explorer application
+# ----------------------------------------------------------------------------
+#
+#  PURPOSE
+#  -------
+#  This module is the single point of contact between the Streamlit UI and the
+#  two external recipe/nutrition APIs the app relies on:
+#
+#    1. TheMealDB  (https://www.themealdb.com/api.php)
+#       A free, public recipe database.  No API key required.
+#       Used for: recipe search, cuisine (area) listing, meal detail lookup,
+#       ingredient catalogue, and cuisine-filtered browsing.
+#
+#    2. Spoonacular  (https://spoonacular.com/food-api)
+#       A freemium recipe + nutrition API.  Requires an API key stored in
+#       Streamlit's secrets manager under the key "SPOONACULAR_API_KEY".
+#       Used for: per-serving nutrition data and diet-filtered recipe search.
+#
+#  DESIGN NOTES
+#  ------------
+#  • Every public function is decorated with @st.cache_data so that repeated
+#    calls (e.g., on every Streamlit re-render) do NOT fire new HTTP requests.
+#    TTL values are tuned to the volatility of the data:
+#      - 1 hour  for data that may change during a user session (search results,
+#        cuisine filters, single-meal lookups, nutrition by ingredients)
+#      - 24 hours for near-static reference data (cuisine list, ingredient
+#        catalogue, nutrition by dish title)
+#
+#  • All network calls use a 20-second timeout and are wrapped in
+#    try/except so that API failures degrade gracefully (empty list / None)
+#    rather than crashing the UI.
+#
+#  • The _area_name_variants() helper was written with AI assistance to handle
+#    the linguistic mismatch between TheMealDB's /list endpoint (which uses
+#    adjectival demonyms like "Indonesian") and its /filter endpoint (which
+#    sometimes only accepts plain country names like "Indonesia").  The curated
+#    mapping dictionary inside it was generated and reviewed with AI help.
+#
+#  DEPENDENCIES
+#  ------------
+#  External packages (must be installed in the project environment):
+#    - requests      HTTP client used for all API calls
+#    - streamlit     Web-app framework; also provides caching (@st.cache_data)
+#                    and secrets management (st.secrets)
+#
+#  Standard-library modules imported inline:
+#    - re            Used in search_spoonacular() to strip HTML tags from
+#                    Spoonacular's summary field
+#
+#  External services:
+#    - TheMealDB API  (free, no auth)  https://www.themealdb.com/api/json/v1/1
+#    - Spoonacular API (needs key)     https://api.spoonacular.com
+#
+# ============================================================================
+
+import requests
+import streamlit as st
+
+# Base URL for all TheMealDB v1 endpoints.
+# TheMealDB offers a free tier at path /api/json/v1/1 with no authentication.
+THEMEALDB_BASE = "https://www.themealdb.com/api/json/v1/1"
+
+
+# ---------------------------------------------------------------------------
+# TheMealDB helpers
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60 * 60)   # Cache results for 1 hour to avoid hammering the API
+def search_recipes_by_name(query: str) -> list[dict]:
+    """Search TheMealDB for recipes whose name contains `query`.
+
+    Returns a list of full meal dicts (each containing name, ingredients,
+    instructions, thumbnail URL, etc.).  Returns an empty list if the
+    network call fails or no results are found.
+
+    Args:
+        query: Free-text search string, e.g. "pasta" or "chicken curry".
+
+    Returns:
+        List of TheMealDB meal dicts, or [] on failure / no results.
+    """
+    try:
+        resp = requests.get(
+            f"{THEMEALDB_BASE}/search.php", params={"s": query}, timeout=20
+        )
+        resp.raise_for_status()   # Raises HTTPError for 4xx / 5xx responses
+        # TheMealDB returns {"meals": [...]} on success, {"meals": null} when
+        # nothing is found — the "or []" handles the null case.
+        return resp.json().get("meals") or []
+    except requests.RequestException as exc:
+        # Show a non-fatal warning in the Streamlit sidebar; don't crash the app
+        st.warning(f"Recipe search unavailable: {exc}")
+        return []
+
+
+@st.cache_data(ttl=24 * 60 * 60)   # Cache for 24 hours; cuisine list rarely changes
+def list_cuisines() -> list[str]:
+    """Return the raw list of cuisine names from TheMealDB (called 'areas').
+
+    TheMealDB uses the word "area" internally for what most users call a
+    "cuisine" or "country".  This function returns all ~200 area names that
+    TheMealDB knows about, regardless of whether they actually have recipes.
+    See list_cuisines_with_recipes() for a filtered version.
+
+    Returns:
+        Sorted list of area/cuisine name strings, e.g. ["British", "Chinese",
+        "French", ...].  Returns [] if the API is unreachable.
+    """
+    try:
+        resp = requests.get(
+            f"{THEMEALDB_BASE}/list.php", params={"a": "list"}, timeout=20
+        )
+        resp.raise_for_status()
+        # Each dict in the "meals" list has a single key: "strArea"
+        return [m["strArea"] for m in (resp.json().get("meals") or [])]
+    except requests.RequestException:
+        return []
+
+
+@st.cache_data(ttl=24 * 60 * 60)   # Expensive (makes many sub-requests); cache 24 h
+def list_cuisines_with_recipes() -> list[str]:
+    """Return only cuisine names that actually have at least one recipe.
+
+    TheMealDB's /list endpoint returns ~200 area names but many of them return
+    zero results when queried via the /filter endpoint (e.g. "Peruvian",
+    "Indonesian").  This function probes each area and returns only the ones
+    that produce real recipe stubs.
+
+    This is intentionally slow on first call (it fires N sub-requests where N
+    is the number of areas) but is cached for 24 hours so subsequent renders
+    are instant.  The result is used by the world-map page so that only
+    countries with actual recipes are made clickable.
+
+    Returns:
+        List of cuisine name strings that have at least one recipe in the DB.
+    """
+    all_areas = list_cuisines()
+    valid = []
+    for area in all_areas:
+        meals = filter_by_cuisine(area)   # Returns [] if no results for this area
+        if meals:
+            valid.append(area)
+    return valid
+
+
+def _area_name_variants(area: str) -> list[str]:
+    """Generate candidate area/cuisine name strings to try with TheMealDB's filter.
+
+    NOTE: This function has no @st.cache_data because it is pure string
+    manipulation with no I/O.  It is called inside the cached filter_by_cuisine().
+
+    BACKGROUND (AI-assisted design):
+    TheMealDB's /list endpoint returns adjectival demonyms ("Indonesian",
+    "Argentine") but its /filter endpoint sometimes only accepts the plain
+    country name ("Indonesia", "Argentina") — or vice versa.  Rather than
+    maintaining a static alias table that breaks whenever TheMealDB adds new
+    areas, this function generates plausible name variants automatically and
+    lets filter_by_cuisine() try each one in turn, stopping at the first hit.
+    The large _AREA_TO_COUNTRY mapping below was generated with AI assistance
+    and then manually reviewed for accuracy.
+
+    Args:
+        area: The area name as returned by TheMealDB's /list endpoint.
+
+    Returns:
+        Ordered list of name strings to try, starting with the original.
+        Typically 1–3 items long.
+    """
+    # Always try the exact name first — it works for the majority of areas
+    candidates: list[str] = [area]
+
+    # -----------------------------------------------------------------------
+    # Suffix-stripping heuristics (left here as documentation of the approach
+    # that was REPLACED by the explicit mapping below).
+    # These suffix rules turn adjective → country name but produce too many
+    # false positives (e.g., "Mexican" → "Mexica") to be relied upon alone.
+    # They are kept here as comments so future maintainers understand why an
+    # explicit mapping was chosen instead.
+    # -----------------------------------------------------------------------
+    suffixes = [
+        ("inian", "inia"),   # Argentinian → Argentina... actually wrong
+        ("nian",  "na"),     # Indonesian → Indonesia ... no
+        ("ian",   "ia"),     # Indonesian → Indonesía, Iranian → Irani
+        ("an",    "a"),      # Mexican → Mexica ... not ideal but harmless
+        ("ese",   ""),       # Vietnamese → Vietnam... nope
+        ("ish",   ""),       # British → Brit
+        ("i",     ""),       # Emirati → Emirat
+        ("er",    ""),       # New Zealander → New Zealand
+    ]
+    # NOTE: The suffix approach above was intentionally NOT used.
+    # The explicit mapping below is more reliable for real-world area names.
+
+    # -----------------------------------------------------------------------
+    # Curated adjective → country-name mapping.
+    # AI-assisted: initial list generated by a language model, then reviewed
+    # and corrected by a human developer.  Update this dict if TheMealDB adds
+    # new areas that aren't resolving correctly.
+    # -----------------------------------------------------------------------
+    _AREA_TO_COUNTRY: dict[str, str] = {
+        "Afghan":          "Afghanistan",
+        "Albanian":        "Albania",
+        "Algerian":        "Algeria",
+        "American":        "United States",
+        "Argentine":       "Argentina",
+        "Argentinian":     "Argentina",
+        "Armenian":        "Armenia",
+        "Australian":      "Australia",
+        "Austrian":        "Austria",
+        "Azerbaijani":     "Azerbaijan",
+        "Bahraini":        "Bahrain",
+        "Bangladeshi":     "Bangladesh",
+        "Belgian":         "Belgium",
+        "Bolivian":        "Bolivia",
+        "Bosnian":         "Bosnia and Herzegovina",
+        "Brazilian":       "Brazil",
+        "British":         "United Kingdom",
+        "Bulgarian":       "Bulgaria",
+        "Burmese":         "Myanmar",
+        "Burundian":       "Burundi",
+        "Cambodian":       "Cambodia",
+        "Cameroonian":     "Cameroon",
+        "Canadian":        "Canada",
+        "Chilean":         "Chile",
+        "Chinese":         "China",
+        "Colombian":       "Colombia",
+        "Costa Rican":     "Costa Rica",
+        "Croatian":        "Croatia",
+        "Cuban":           "Cuba",
+        "Cypriot":         "Cyprus",
+        "Czech":           "Czechia",
+        "Danish":          "Denmark",
+        "Dominican":       "Dominican Republic",
+        "Dutch":           "Netherlands",
+        "Ecuadoran":       "Ecuador",
+        "Egyptian":        "Egypt",
+        "Emirati":         "United Arab Emirates",
+        "Estonian":        "Estonia",
+        "Ethiopian":       "Ethiopia",
+        "Filipino":        "Philippines",
+        "Finnish":         "Finland",
+        "French":          "France",
+        "Georgian":        "Georgia",
+        "German":          "Germany",
+        "Ghanaian":        "Ghana",
+        "Greek":           "Greece",
+        "Guatemalan":      "Guatemala",
+        "Guyanese":        "Guyana",
+        "Haitian":         "Haiti",
+        "Honduran":        "Honduras",
+        "Hungarian":       "Hungary",
+        "Icelander":       "Iceland",
+        "Indian":          "India",
+        "Indonesian":      "Indonesia",
+        "Iranian":         "Iran",
+        "Iraqi":           "Iraq",
+        "Irish":           "Ireland",
+        "Israeli":         "Israel",
+        "Italian":         "Italy",
+        "Ivorian":         "Ivory Coast",
+        "Jamaican":        "Jamaica",
+        "Japanese":        "Japan",
+        "Jordanian":       "Jordan",
+        "Kazakhstani":     "Kazakhstan",
+        "Kenyan":          "Kenya",
+        "Kirghiz":         "Kyrgyzstan",
+        "Kosovar":         "Kosovo",
+        "Kuwaiti":         "Kuwait",
+        "Laotian":         "Laos",
+        "Latvian":         "Latvia",
+        "Lebanese":        "Lebanon",
+        "Libyan":          "Libya",
+        "Lithuanian":      "Lithuania",
+        "Luxembourger":    "Luxembourg",
+        "Macedonian":      "North Macedonia",
+        "Malagasy":        "Madagascar",
+        "Malawian":        "Malawi",
+        "Malaysian":       "Malaysia",
+        "Malian":          "Mali",
+        "Maltese":         "Malta",
+        "Mauritanian":     "Mauritania",
+        "Mauritian":       "Mauritius",
+        "Mexican":         "Mexico",
+        "Moldovan":        "Moldova",
+        "Mongolian":       "Mongolia",
+        "Montenegrin":     "Montenegro",
+        "Moroccan":        "Morocco",
+        "Mozambican":      "Mozambique",
+        "Namibian":        "Namibia",
+        "Nepalese":        "Nepal",
+        "New Zealander":   "New Zealand",
+        "Nicaraguan":      "Nicaragua",
+        "Nigerian":        "Nigeria",
+        "Nigerien":        "Niger",
+        "North Korean":    "North Korea",
+        "Norwegian":       "Norway",
+        "Omani":           "Oman",
+        "Pakistani":       "Pakistan",
+        "Palestinian":     "Palestine",
+        "Panamanian":      "Panama",
+        "Paraguayan":      "Paraguay",
+        "Peruvian":        "Peru",
+        "Polish":          "Poland",
+        "Portuguese":      "Portugal",
+        "Puerto Rican":    "Puerto Rico",
+        "Qatari":          "Qatar",
+        "Romanian":        "Romania",
+        "Russian":         "Russia",
+        "Rwandan":         "Rwanda",
+        "Salvadoran":      "El Salvador",
+        "Samoan":          "Samoa",
+        "Saudi Arabian":   "Saudi Arabia",
+        "Senegalese":      "Senegal",
+        "Serbian":         "Serbia",
+        "Seychellois":     "Seychelles",
+        "Sierra Leonean":  "Sierra Leone",
+        "Singaporean":     "Singapore",
+        "Slovak":          "Slovakia",
+        "Slovene":         "Slovenia",
+        "Somali":          "Somalia",
+        "South African":   "South Africa",
+        "South Korean":    "South Korea",
+        "South Sudanese":  "South Sudan",
+        "Spanish":         "Spain",
+        "Sri Lankan":      "Sri Lanka",
+        "Sudanese":        "Sudan",
+        "Surinamer":       "Suriname",
+        "Swedish":         "Sweden",
+        "Swiss":           "Switzerland",
+        "Syrian":          "Syria",
+        "Tadhzik":         "Tajikistan",
+        "Taiwanese":       "Taiwan",
+        "Tanzanian":       "Tanzania",
+        "Thai":            "Thailand",
+        "Togolese":        "Togo",
+        "Tongan":          "Tonga",
+        "Trinidadian":     "Trinidad and Tobago",
+        "Tunisian":        "Tunisia",
+        "Turkish":         "Turkey",
+        "Ugandan":         "Uganda",
+        "Ukrainian":       "Ukraine",
+        "Uruguayan":       "Uruguay",
+        "Uzbekistani":     "Uzbekistan",
+        "Venezuelan":      "Venezuela",
+        "Vietnamese":      "Vietnam",
+        "Yemeni":          "Yemen",
+        "Zambian":         "Zambia",
+        "Zimbabwean":      "Zimbabwe",
+        # A few areas where TheMealDB uses the plain country name in /filter
+        # but the adjective form in /list — include the reverse direction too.
+        "Argentina":       "Argentinian",
+        "Venezuela":       "Venezuelan",
+        "Indonesia":       "Indonesian",
+    }
+
+    # Forward lookup: adjective (e.g. "Indonesian") → country ("Indonesia")
+    alt = _AREA_TO_COUNTRY.get(area)
+    if alt and alt not in candidates:
+        candidates.append(alt)
+
+    # Reverse lookup: country name → adjective, for areas where the table maps
+    # country → adjective (the three entries at the bottom of the dict above)
+    reverse = {v: k for k, v in _AREA_TO_COUNTRY.items()}
+    alt2 = reverse.get(area)
+    if alt2 and alt2 not in candidates:
+        candidates.append(alt2)
+
+    return candidates
+
+
+@st.cache_data(ttl=60 * 60)   # Cache 1 hour; recipe lists change occasionally
+def filter_by_cuisine(cuisine: str) -> list[dict]:
+    """Return lightweight recipe stubs for a given cuisine name.
+
+    Each stub contains only the meal ID, name, and thumbnail URL — NOT the
+    full ingredient/instruction data.  Use get_meal_by_id() to hydrate a stub
+    into a full meal dict.
+
+    This function transparently handles TheMealDB's inconsistent area naming
+    by delegating to _area_name_variants() and trying each candidate name in
+    order until one returns results.
+
+    Args:
+        cuisine: Area/cuisine name, in any form TheMealDB might accept
+                 (e.g. "Indonesian", "Indonesia", "British", etc.).
+
+    Returns:
+        List of lightweight meal dicts with keys: idMeal, strMeal,
+        strMealThumb.  Returns [] if no results found or on network error.
+    """
+    for candidate in _area_name_variants(cuisine):
+        try:
+            resp = requests.get(
+                f"{THEMEALDB_BASE}/filter.php", params={"a": candidate}, timeout=20
+            )
+            resp.raise_for_status()
+            meals = resp.json().get("meals") or []
+            if meals:
+                # Found results for this name variant — stop trying further candidates
+                return meals
+        except requests.RequestException:
+            # Network error: bail out immediately rather than retrying other variants
+            return []
+    return []   # All name variants exhausted with no results
+
+
+@st.cache_data(ttl=60 * 60)   # Cache 1 hour; individual meal data is stable
+def get_meal_by_id(meal_id: str) -> dict | None:
+    """Fetch the full detail record for a single meal from TheMealDB.
+
+    Args:
+        meal_id: The TheMealDB numeric meal ID as a string (e.g. "52772").
+
+    Returns:
+        Full meal dict with all 20 ingredient/measure fields, instructions,
+        YouTube link, tags, etc.  Returns None if not found or on error.
+    """
+    try:
+        resp = requests.get(
+            f"{THEMEALDB_BASE}/lookup.php", params={"i": meal_id}, timeout=20
+        )
+        resp.raise_for_status()
+        meals = resp.json().get("meals") or []
+        # The lookup endpoint returns a list but always has 0 or 1 items
+        return meals[0] if meals else None
+    except requests.RequestException:
+        return None
+
+
+@st.cache_data(ttl=60 * 60)   # Cache 1 hour — the combined fetch can be slow
+def fetch_cuisine_meals(cuisine: str, limit: int = 10) -> list[dict]:
+    """Return full meal dicts for a cuisine, batched and cached in one call.
+
+    PERFORMANCE NOTE: Earlier versions of this function were called without
+    caching from the Recipes page, triggering up to 10 sequential HTTP
+    requests on every Streamlit re-render.  By moving the full fetch logic
+    here under @st.cache_data, subsequent renders within the 1-hour window
+    cost zero network calls.
+
+    This function combines filter_by_cuisine() (which returns stubs) and
+    get_meal_by_id() (which hydrates each stub) so callers get full meal
+    dicts in a single cached operation.
+
+    Args:
+        cuisine: Area/cuisine name passed to filter_by_cuisine().
+        limit:   Max number of meals to return (default 10).
+
+    Returns:
+        List of full meal dicts (up to `limit` items).  Items where
+        get_meal_by_id() returns None are silently skipped.
+    """
+    stubs = filter_by_cuisine(cuisine)[:limit]
+    # Walrus operator (:=) fetches and assigns in one expression;
+    # the conditional filters out any stubs whose lookup returned None.
+    return [m for stub in stubs if (m := get_meal_by_id(stub["idMeal"]))]
+
+
+# ---------------------------------------------------------------------------
+# Ingredient extraction
+# ---------------------------------------------------------------------------
+
+def extract_ingredients_from_meal(meal: dict) -> list[str]:
+    """Parse the ingredient and measure fields out of a TheMealDB meal dict.
+
+    TheMealDB stores ingredients in 20 parallel numbered fields:
+      strIngredient1 … strIngredient20
+      strMeasure1    … strMeasure20
+    Fields beyond the last ingredient are empty strings or None.
+
+    Returns a list like ["2 cups flour", "1 tsp salt", "egg"] where the
+    measure is prepended when present.
+
+    Args:
+        meal: A full TheMealDB meal dict (as returned by get_meal_by_id()).
+
+    Returns:
+        List of "measure ingredient" strings.  Empty/null fields are skipped.
+    """
+    ingredients = []
+    for i in range(1, 21):   # TheMealDB has exactly 20 ingredient slots
+        name    = (meal.get(f"strIngredient{i}") or "").strip()
+        measure = (meal.get(f"strMeasure{i}")    or "").strip()
+        if name:
+            # Combine measure + name when a measure is present (e.g. "2 cups flour")
+            # or use just the name when it isn't (e.g. "salt")
+            ingredients.append(f"{measure} {name}".strip() if measure else name)
+    return ingredients
+
+
+@st.cache_data(ttl=24 * 60 * 60)   # Cache 24 h; ingredient catalogue rarely changes
+def get_themealdb_ingredients() -> list[str]:
+    """Fetch the complete ingredient catalogue from TheMealDB, sorted A–Z.
+
+    WHY THIS INSTEAD OF SPOONACULAR?
+    Spoonacular's ingredient list is paid and quota-limited.  TheMealDB
+    provides a free ingredient list whose names exactly match those used in
+    TheMealDB recipes — so pantry searches and ingredient matching work
+    without any name-normalisation step.
+
+    Returns:
+        Alphabetically sorted list of lowercase ingredient name strings.
+        Returns [] if the API is unreachable (pantry feature still works,
+        just without autocomplete suggestions).
+    """
+    try:
+        resp = requests.get(
+            f"{THEMEALDB_BASE}/list.php",
+            params={"i": "list"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        meals = resp.json().get("meals") or []
+        # Normalise to lowercase and sort alphabetically so the UI list is
+        # consistent regardless of how TheMealDB capitalises the names.
+        return sorted(
+            m["strIngredient"].strip().lower()
+            for m in meals
+            if (m.get("strIngredient") or "").strip()   # Skip empty/null entries
+        )
+    except requests.RequestException:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Nutrition — Spoonacular
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=24 * 60 * 60)   # Cache 24 h; nutrition data for a given dish is static
+def fetch_nutrition_by_title(title: str) -> dict:
+    """Look up per-serving nutrition for a dish by its name via Spoonacular.
+
+    Uses Spoonacular's complexSearch endpoint with addRecipeNutrition=True.
+    Returns the first result's nutrition data already normalised per serving —
+    callers do NOT need to divide by serving count.
+
+    Requires st.secrets["SPOONACULAR_API_KEY"] to be set.
+
+    Args:
+        title: Dish name to search for, e.g. "Spaghetti Bolognese".
+
+    Returns:
+        Dict with keys: kcal (int|None), protein_g (float|None),
+        carbs_g (float|None), fat_g (float|None).
+        All values are None if the API is unreachable or returns no results.
+    """
+    # Define the "empty" return value used for early exits and error cases
+    empty = {"kcal": None, "protein_g": None, "carbs_g": None, "fat_g": None}
+    if not title:
+        return empty
+    try:
+        resp = requests.get(
+            "https://api.spoonacular.com/recipes/complexSearch",
+            params={
+                "apiKey": st.secrets["SPOONACULAR_API_KEY"],
+                "query":  title,
+                "number": 1,                    # Only need the top result
+                "addRecipeNutrition": True,      # Include nutrition data in response
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            return empty
+        nutrients = results[0].get("nutrition", {}).get("nutrients", [])
+
+        # Helper to find a named nutrient's amount in the nested list
+        def _get(name):
+            return next((n["amount"] for n in nutrients if n.get("name") == name), None)
+
+        kcal    = _get("Calories")
+        protein = _get("Protein")
+        carbs   = _get("Carbohydrates")
+        fat     = _get("Fat")
+        return {
+            "kcal":      int(round(kcal))    if kcal    is not None else None,
+            "protein_g": round(protein, 1)   if protein is not None else None,
+            "carbs_g":   round(carbs, 1)     if carbs   is not None else None,
+            "fat_g":     round(fat, 1)       if fat     is not None else None,
+        }
+    except Exception:
+        return empty
+
+
+@st.cache_data(ttl=24 * 60 * 60)   # Cache 24 h; ingredient nutrition is stable
+def fetch_nutrition_from_ingredients(ingredients: tuple[str, ...]) -> dict:
+    """Estimate whole-recipe nutrition by parsing raw ingredient strings.
+
+    Uses Spoonacular's parseIngredients endpoint which understands natural-
+    language strings like "2 cups all-purpose flour, sifted" and returns
+    per-ingredient nutrition that this function sums into recipe totals.
+
+    WHY A TUPLE, NOT A LIST?
+    @st.cache_data requires all arguments to be hashable.  Lists are not
+    hashable; tuples are.  Callers must pass the ingredients as a tuple.
+
+    IMPORTANT: Returns WHOLE-RECIPE totals, not per-serving values.
+    Callers must divide by the appropriate serving count (default assumed
+    to be 4 in fetch_nutrition_for_meal()).
+
+    Args:
+        ingredients: Tuple of ingredient strings, e.g.
+                     ("2 cups flour", "1 tsp salt", "3 eggs").
+
+    Returns:
+        Dict with keys: kcal (int), protein_g (float), carbs_g (float),
+        fat_g (float).  All values are None on error or empty input.
+    """
+    empty = {"kcal": None, "protein_g": None, "carbs_g": None, "fat_g": None}
+    if not ingredients:
+        return empty
+    try:
+        resp = requests.post(
+            "https://api.spoonacular.com/recipes/parseIngredients",
+            params={
+                "apiKey": st.secrets["SPOONACULAR_API_KEY"],
+                "includeNutrition": True,
+            },
+            # Send as form-encoded data, not JSON — Spoonacular's parser requires it
+            data={"ingredientList": "\n".join(ingredients), "servings": 1},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        # Accumulate totals across all parsed ingredient items
+        kcal = protein = carbs = fat = 0.0
+        for item in resp.json():
+            for n in item.get("nutrition", {}).get("nutrients", []):
+                amt = n.get("amount", 0) or 0   # Guard against None values
+                if n.get("name") == "Calories":        kcal    += amt
+                elif n.get("name") == "Protein":       protein += amt
+                elif n.get("name") == "Carbohydrates": carbs   += amt
+                elif n.get("name") == "Fat":           fat     += amt
+        return {
+            "kcal":      int(round(kcal)),
+            "protein_g": round(protein, 1),
+            "carbs_g":   round(carbs, 1),
+            "fat_g":     round(fat, 1),
+        }
+    except Exception:
+        return empty
+
+
+def fetch_nutrition_for_meal(meal: dict) -> dict:
+    """Return accurate per-serving nutrition for a TheMealDB meal dict.
+
+    This is the main nutrition entry point for the UI — it implements a
+    two-step fallback strategy to maximise coverage while minimising
+    Spoonacular quota usage:
+
+      Step 1 — Title lookup (preferred):
+        Calls fetch_nutrition_by_title() with the meal's name.  This uses
+        Spoonacular's complexSearch which returns Spoonacular's own recipe
+        data matched by name.  Accurate and cached 24 h.
+
+      Step 2 — Ingredient parser (fallback):
+        If step 1 returns no data (dish name not in Spoonacular's index),
+        calls fetch_nutrition_from_ingredients() with the meal's ingredients.
+        Divides the whole-recipe total by 4 to get a per-serving estimate.
+        Less accurate but covers more dishes.
+
+    NOTE: This function itself is NOT cached because its two sub-functions
+    are already cached.  Adding another cache layer here would be redundant.
+
+    Args:
+        meal: A full TheMealDB meal dict.
+
+    Returns:
+        Per-serving nutrition dict with keys kcal, protein_g, carbs_g, fat_g.
+        Values may be None if both strategies fail.
+    """
+    # Try the fast path first: look up by dish title
+    result = fetch_nutrition_by_title(meal.get("strMeal", ""))
+    if result["kcal"] is not None:
+        return result   # Title lookup succeeded; return immediately
+
+    # Fallback: derive nutrition from the ingredient list
+    # Pass as a tuple (not list) so the result is hashable and cacheable
+    raw = fetch_nutrition_from_ingredients(
+        tuple(extract_ingredients_from_meal(meal))
+    )
+    srv = 4   # Assumed serving count when none is known — TheMealDB doesn't provide this
+    return {
+        "kcal":      int(round(raw["kcal"] / srv))      if raw["kcal"]      is not None else None,
+        "protein_g": round(raw["protein_g"] / srv, 1)   if raw["protein_g"] is not None else None,
+        "carbs_g":   round(raw["carbs_g"] / srv, 1)     if raw["carbs_g"]   is not None else None,
+        "fat_g":     round(raw["fat_g"] / srv, 1)       if raw["fat_g"]     is not None else None,
+    }
+
+
+def fetch_kcal_for_title(title: str) -> int | None:
+    """Convenience wrapper — returns just the calorie count for a dish title.
+
+    Thin wrapper around fetch_nutrition_by_title() for callers that only need
+    the calorie value (e.g., the meal-card summary row in the UI).
+
+    Args:
+        title: Dish name string.
+
+    Returns:
+        Integer kilocalories per serving, or None if unavailable.
+    """
+    return fetch_nutrition_by_title(title)["kcal"]
+
+
+@st.cache_data(ttl=60 * 60)   # Cache 1 hour; search results can change but are stable
+def search_spoonacular(query="", vegetarian=False, vegan=False,
+                       gluten_free=False, dairy_free=False) -> list[dict]:
+    """Search Spoonacular for recipes, optionally filtered by dietary requirements.
+
+    Returns results normalised into a dict shape that is compatible with the
+    TheMealDB meal dicts used everywhere else in the app, so that UI components
+    can render both sources identically.
+
+    KEY DESIGN DECISION — TWO INGREDIENT FIELDS (AI-assisted):
+    Spoonacular provides two useful strings per ingredient:
+      "name"     → plain ingredient name, e.g. "flour"
+      "original" → full cooking string, e.g. "2 cups all-purpose flour, sifted"
+
+    Both are stored under different keys for different consumers:
+      _ingredients         (plain names)   → used by the ML similarity model
+                                             and the wishlist feature.  The ML
+                                             model compares ingredient sets; if
+                                             it receives "2 cups all-purpose
+                                             flour, sifted" it cannot match that
+                                             against "flour" from a TheMealDB
+                                             recipe, so similarity scores drop
+                                             to zero.  Plain names match reliably.
+      _ingredients_display (full strings)  → used only for rendering the
+                                             ingredient list in recipe-card
+                                             expanders so the user sees useful
+                                             quantities, not just bare names.
+
+    Args:
+        query:       Free-text search term (can be empty for browsing).
+        vegetarian:  If True, restrict to vegetarian recipes.
+        vegan:       If True, restrict to vegan recipes (overrides vegetarian).
+        gluten_free: If True, exclude recipes containing gluten.
+        dairy_free:  If True, exclude recipes containing dairy.
+
+    Returns:
+        List of normalised meal dicts with the same keys as TheMealDB meals
+        (strMeal, strMealThumb, strArea, strCategory, strInstructions) plus
+        Spoonacular-specific keys (_ingredients, _ingredients_display,
+        source="spoonacular", kcal_per_serv).
+        Returns [] if the API is unreachable.
+    """
+    try:
+        # Build the diet string: Spoonacular uses a single "diet" param
+        # and treats vegan as a superset of vegetarian
+        diet = "vegan" if vegan else ("vegetarian" if vegetarian else None)
+
+        # Build the intolerances list for gluten/dairy exclusions
+        intolerances = []
+        if gluten_free: intolerances.append("gluten")
+        if dairy_free:  intolerances.append("dairy")
+
+        params = {
+            "apiKey": st.secrets["SPOONACULAR_API_KEY"],
+            "query":  query, "number": 20,
+            "addRecipeInformation": True,   # Include dish type, summary, etc.
+            "fillIngredients": True,         # Include extendedIngredients list
+            "addRecipeNutrition": True,      # Include calorie/macro data
+        }
+        if diet:         params["diet"] = diet
+        if intolerances: params["intolerances"] = ",".join(intolerances)
+
+        resp = requests.get(
+            "https://api.spoonacular.com/recipes/complexSearch",
+            params=params, timeout=20,
+        )
+        resp.raise_for_status()
+
+        # re is imported here (not at module top) because it's only needed in
+        # this function — avoids polluting the module namespace for the common
+        # case where search_spoonacular() is never called.
+        import re
+        results = []
+        for r in resp.json().get("results", []):
+            nutrients = r.get("nutrition", {}).get("nutrients", [])
+            # Extract just the calorie value from the nutrients list for the card summary
+            kcal = next(
+                (int(n["amount"]) for n in nutrients if n.get("name") == "Calories"), None
+            )
+            results.append({
+                "strMeal":         r.get("title", ""),
+                "strMealThumb":    r.get("image", ""),
+                "strArea":         "International",   # Spoonacular doesn't provide a country/area
+                # Use first dish type as the category, title-cased; fall back to em-dash
+                "strCategory":     r.get("dishTypes", [""])[0].title() if r.get("dishTypes") else "—",
+                # Strip HTML tags from Spoonacular's summary (it contains <b>, <a>, etc.)
+                "strInstructions": re.sub(r"<[^>]+>", "", r.get("summary", "")),
+                # Plain ingredient names for ML model and wishlist matching
+                "_ingredients":         [i.get("name","").strip() for i in r.get("extendedIngredients",[]) if i.get("name","").strip()],
+                # Full ingredient strings (with quantities) for display in recipe cards
+                "_ingredients_display": [i.get("original","").strip() for i in r.get("extendedIngredients",[]) if i.get("original","").strip()],
+                "source":          "spoonacular",   # Tag so UI can differentiate data sources
+                "kcal_per_serv":   kcal,
+            })
+        return results
+    except Exception as exc:
+        st.warning(f"Spoonacular unavailable: {exc}")
+        return []
